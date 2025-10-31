@@ -1,92 +1,66 @@
-# main.py
-import os
-import time
 import ccxt
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime
+import os, requests, datetime
 
-# ---------------- Config ----------------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# Majör coin listesi (Binance spot semboller)
-COINS = ["BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT","ADA/USDT",
-         "AVAX/USDT","DOGE/USDT","DOT/USDT","LINK/USDT","MATIC/USDT","LTC/USDT"]
+def send_telegram(msg):
+    if TOKEN and CHAT_ID:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-TF = "4h"
-LIMIT = 500  # yeterli geçmiş mum
-MIN_ROWS = 60
+exchange = ccxt.binance()
+exchange.load_markets()
 
-VOL_MULT = 1.5  # hacim spike eşiği
-ORDERBLOCK_DIST_PCT = 0.8  # orderblock'a %0.8 yakınsa (0.8%) etki (yüzde)
-
-exchange = ccxt.binance({"enableRateLimit": True})
-
-# ---------------- Helpers ----------------
-def send_telegram(text):
-    if not TOKEN or not CHAT_ID:
-        print("Telegram bilgileri yok, mesaj atılamadı.")
-        return False
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+def fetch(symbol, tf="1h"):
     try:
-        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode":"HTML"})
-        return resp.status_code == 200
-    except Exception as e:
-        print("Telegram error:", e)
-        return False
-
-def fetch_ohlcv(symbol, timeframe=TF, limit=LIMIT):
-    try:
-        data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not data:
-            return None
-        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["ts"], unit='ms')
-        df = df.reset_index(drop=True)
-        return df
-    except Exception as e:
-        print(f"fetch_ohlcv error {symbol}: {e}")
+        data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=200)
+        return pd.DataFrame(data, columns=["t","o","h","l","c","v"])
+    except:
         return None
-
-def ema(series, span):
-    return series.ewm(span=span, adjust=False).mean()
-
-def macd_hist(series, fast=12, slow=26, signal=9):
-    fast_ema = series.ewm(span=fast, adjust=False).mean()
-    slow_ema = series.ewm(span=slow, adjust=False).mean()
-    macd_line = fast_ema - slow_ema
-    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - macd_signal
-    return macd_line, macd_signal, hist
 
 def rsi(series, period=14):
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.rolling(period, min_periods=1).mean()
-    ma_down = down.rolling(period, min_periods=1).mean().replace(0, 1e-9)
-    rs = ma_up / ma_down
+    gain = np.where(delta>0, delta, 0)
+    loss = np.where(delta<0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(period).mean()
+    avg_loss = pd.Series(loss).rolling(period).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def find_last_engulfing(df, lookback=80):
-    """
-    Basit orderblock proxy: son bullish veya bearish engulfing mumunu bul.
-    Returns tuple (type, index, price_level)
-      type: "bull" or "bear" or None
-      price_level: low for bull, high for bear
-    """
-    n = min(len(df)-1, lookback)
-    for i in range(len(df)-1, len(df)-n-1, -1):
-        if i <= 0: break
-        prev = df.iloc[i-1]
-        curr = df.iloc[i]
-        # bullish engulfing: prev down (close<open), curr up and body engulfs prev body
-        if (prev['close'] < prev['open']) and (curr['close'] > curr['open']) and (curr['close'] - curr['open'] > prev['open'] - prev['close']):
-            return "bull", i, float(curr['low'])
-        # bearish engulfing
-        if (prev['close'] > prev['open']) and (curr['close'] < curr['open']) and (curr['open'] - curr['close'] > prev['close'] - prev['open']):
-            return "bear", i, float(curr['high'])
-    return None, None, None
+def analyze(symbol):
+    df = fetch(symbol)
+    if df is None or len(df) < 50: 
+        return None
+    
+    df["ema20"] = df["c"].ewm(span=20).mean()
+    df["ema50"] = df["c"].ewm(span=50).mean()
+    df["rsi"] = rsi(df["c"])
+    df["vol_chg"] = df["v"].pct_change() * 100
+    
+    last, prev = df.iloc[-1], df.iloc[-2]
 
+    buy = last["c"] > last["ema20"] and 30 < last["rsi"] < 65 and last["vol_chg"] > 25
+    sell = last["c"] < last["ema20"] and last["rsi"] > 60 and last["vol_chg"] > 20
+
+    if buy:
+        return f"✅ {symbol} AL Sinyali | RSI {last['rsi']:.1f} | Hacim +{last['vol_chg']:.0f}%"
+    if sell:
+        return f"⚠️ {symbol} SAT Sinyali | RSI {last['rsi']:.1f} | Hacim +{last['vol_chg']:.0f}%"
+    return None
+
+majors = ["BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT","DOGE/USDT","ADA/USDT","AVAX/USDT"]
+
+signals = []
+for s in majors:
+    res = analyze(s)
+    if res: signals.append(res)
+
+now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+if signals:
+    send_telegram(f"📡 Piyasa Tarama ({now})\n" + "\n".join(signals))
+else:
+    print("Sinyal yok, sessiz çalıştı ✅")
